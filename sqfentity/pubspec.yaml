@@ -20,7 +20,11 @@ dependencies:
       path: sqfentity_gen
       url: https://github.com/aynova-tecnologia/sqfEntity.git
   sqflite_common: ^2.0.0+2
-  sqflite_common_ffi: ^2.0.0
+  sqflite_common_ffi: #^2.0.0
+    git:
+      url: https://github.com/aynova-tecnologia/sqflite.git
+      ref: 26868f796627a81b7bc352f9c403295e9158e9ee
+      path: sqflite_common_ffi
 
 
 

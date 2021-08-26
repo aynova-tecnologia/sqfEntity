@@ -191,10 +191,12 @@ packages:
   sqflite_common_ffi:
     dependency: "direct main"
     description:
-      name: sqflite_common_ffi
-      url: "https://pub.dartlang.org"
-    source: hosted
-    version: "2.0.0"
+      path: sqflite_common_ffi
+      ref: "26868f796627a81b7bc352f9c403295e9158e9ee"
+      resolved-ref: "26868f796627a81b7bc352f9c403295e9158e9ee"
+      url: "https://github.com/aynova-tecnologia/sqflite.git"
+    source: git
+    version: "2.0.0+1"
   sqflite_sqlcipher:
     dependency: "direct main"
     description:
