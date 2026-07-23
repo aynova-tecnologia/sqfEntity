@@ -19,10 +19,12 @@
 import 'dart:async' show Future;
 import 'dart:convert';
 import 'dart:io';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/services.dart';
 import 'package:sqfentity/sqfentity_connection.dart';
 import 'package:sqfentity/sqfentity_connection_base.dart';
 import 'package:sqfentity/sqfentity_connection_ffi.dart';
+import 'package:sqfentity/sqfentity_connection_web.dart';
 import 'package:sqfentity_gen/sqfentity_gen.dart';
 //import 'package:sqflite/sqflite.dart';
 import 'package:sqflite_sqlcipher/sqflite.dart';
@@ -45,7 +47,12 @@ class SqfEntityProvider extends SqfEntityModelBase {
             dbVersion: _dbModel!.dbVersion ?? 1,
             password: _dbModel!.password,
             databasePath: _dbModel!.databasePath);
-    if (!Platform.isWindows && !Platform.isLinux) {
+    // IMPORTANTE: a checagem de web vem PRIMEIRO. `Platform` é do `dart:io` e
+    // lança UnsupportedError no Flutter Web — avaliá-lo antes impediria o banco
+    // de abrir no navegador. Nativo mantém exatamente o comportamento anterior.
+    if (kIsWeb) {
+      _connectionBase = SqfEntityConnectionWeb(_connection!);
+    } else if (!Platform.isWindows && !Platform.isLinux) {
       _connectionBase = SqfEntityConnectionMobile(_connection!);
     } else {
       _connectionBase = SqfEntityConnectionFfi(_connection!);

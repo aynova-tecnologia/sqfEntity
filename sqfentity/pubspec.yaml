@@ -13,8 +13,11 @@ dependencies:
   sqflite_sqlcipher: ^3.1.0+1
   synchronized: ^3.0.0+2
   path: ^1.8.2
-  sqfentity_gen:
-    path: ../sqfentity_gen # remove the first comment mark if you want to debug sqfentity_gen package on your local file system
+  # [PORT WEB] O repo usa path (monorepo de desenvolvimento), mas aqui o fork é
+  # consumido como dependência de um app externo. Apontar para o pacote
+  # publicado (mesma versão 2.5.0 do repo) evita ter que overridar também o
+  # sqfentity_gen no app — mantendo apenas UM override.
+  sqfentity_gen: ^2.5.0
   sqflite_common: ^2.2.1+1
   sqflite_common_ffi: ^2.1.1+1
   meta: ^1.12.0
