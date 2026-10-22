@@ -16,7 +16,7 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
-import 'dart:async' show Future;
+import 'dart:async' show Completer, Future, unawaited;
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart' show kIsWeb;
@@ -71,9 +71,23 @@ class SqfEntityProvider extends SqfEntityModelBase {
   static Map<String, Database?>? _dbMap;
   static Map<String, Batch?>? _openedBatch;
 
+  /// Batch opened explicitly by the caller with [batchStart]. Implicit batches
+  /// ([execSQLList], [rawInsertAll]) use their own local batch and never appear
+  /// here, so other writes (execSQL, insert, update...) do not join them.
   static Map<String, Batch?> get openedBatch {
     return _openedBatch = _openedBatch ?? <String, Batch?>{};
   }
+
+  /// One write queue per database (see [_FilaEscrita]).
+  static final Map<String, _FilaEscrita> _filas = <String, _FilaEscrita>{};
+
+  /// How long an implicit batch waits behind a transaction opened with
+  /// execSQL('BEGIN') before running inside it. Avoids a deadlock when the same
+  /// flow runs a batch inside its own raw transaction. Changeable for tests.
+  static Duration esperaMaximaTransacaoCrua = const Duration(seconds: 30);
+
+  _FilaEscrita get _fila =>
+      _filas.putIfAbsent(_dbModel!.databaseName!, () => _FilaEscrita());
 
   Future<Database?> get db async {
     _dbMap = _dbMap ?? <String, Database?>{};
@@ -108,9 +122,76 @@ class SqfEntityProvider extends SqfEntityModelBase {
     return result;
   }
 
+  /// Waits for the write queue. Returns the release function, or null when it
+  /// stopped waiting behind a raw transaction (see [esperaMaximaTransacaoCrua]):
+  /// then the caller writes directly, inside that transaction.
+  Future<void Function()?> _esperarVez() async {
+    // Opens the database BEFORE taking the turn: initializeDB runs its own
+    // batches (indexes) and would wait forever for the turn held by the caller.
+    await db;
+    final Future<void Function()> vez = _fila.entrar();
+    while (true) {
+      final Object? r = await Future.any<Object?>(<Future<Object?>>[
+        vez,
+        Future<Object?>.delayed(esperaMaximaTransacaoCrua, () => null),
+      ]);
+      if (r is void Function()) {
+        return r;
+      }
+      if (_fila.transacaoCrua) {
+        print('SQFENTITY: write waited $esperaMaximaTransacaoCrua behind a '
+            "transaction opened with execSQL('BEGIN'); running inside it.");
+        // Releases the slot as soon as it arrives, so the queue keeps moving.
+        unawaited(vez.then((void Function() liberar) => liberar()));
+        return null;
+      }
+    }
+  }
+
   /// Run sql command with arguments (arguments is optional)
+  ///
+  /// BEGIN / COMMIT / ROLLBACK run directly on the connection (never inside a
+  /// batch) and hold the write queue from BEGIN until COMMIT/ROLLBACK: before,
+  /// a screen's BEGIN went into the sync's open batch, whose commit failed with
+  /// "cannot start a transaction within a transaction".
   Future<BoolResult> execSQL(String pSql, [List<dynamic>? arguments]) async {
     final BoolResult result = BoolResult(success: false);
+    final String comando = pSql.trimLeft().toUpperCase();
+    final bool inicioTransacao = comando.startsWith('BEGIN');
+    final bool fimTransacao = comando.startsWith('COMMIT') ||
+        comando.startsWith('END') ||
+        (comando.startsWith('ROLLBACK') && !comando.startsWith('ROLLBACK TO'));
+
+    if (inicioTransacao) {
+      final void Function()? liberar = await _esperarVez();
+      try {
+        final Database db = (await this.db)!;
+        await db.execute(pSql, arguments);
+        _fila.abrirTransacaoCrua(liberar);
+        result
+          ..success = true
+          ..successMessage = 'transaction started';
+      } catch (e) {
+        liberar?.call();
+        result.errorMessage = e.toString();
+      }
+      return result;
+    }
+
+    if (fimTransacao) {
+      try {
+        final Database db = (await this.db)!;
+        await db.execute(pSql, arguments);
+        result
+          ..success = true
+          ..successMessage = 'transaction finished';
+      } catch (e) {
+        result.errorMessage = e.toString();
+      } finally {
+        _fila.fecharTransacaoCrua();
+      }
+      return result;
+    }
 
     try {
       if (openedBatch[_dbModel!.databaseName!] == null) {
@@ -133,30 +214,48 @@ class SqfEntityProvider extends SqfEntityModelBase {
   }
 
   /// Run sql command List
+  ///
+  /// Inside a batch opened by the caller ([batchStart]) the commands are only
+  /// queued. Otherwise they run in an own batch, after the previous writes in
+  /// the queue: before, a second call joined the batch the first one was
+  /// committing, or opened a transaction on top of it.
   Future<BoolCommitResult> execSQLList(List<String> pSql,
       {bool? exclusive, bool? noResult, bool? continueOnError}) async {
     final result = BoolCommitResult(success: false);
-    // If there is no open transaction, start one
-    final bool closeBatch = !await batchStart();
-    for (String sql in pSql) {
-      openedBatch[_dbModel!.databaseName!]!.execute(sql);
-    }
-    if (closeBatch) {
-      try {
-        result
-          ..commitResult = await batchCommit(
-              exclusive: exclusive,
-              noResult: noResult,
-              continueOnError: continueOnError)
-          ..success = true;
-      } catch (e) {
-        result.errorMessage = e.toString();
-        print('SQFENTITY ERROR while run execSQLList:');
-        print(result.toString());
+    final Batch? loteDoChamador = openedBatch[_dbModel!.databaseName!];
+    if (loteDoChamador != null) {
+      for (String sql in pSql) {
+        loteDoChamador.execute(sql);
       }
-      openedBatch[_dbModel!.databaseName!] = null;
-    } else {
       result.success = true;
+      return result;
+    }
+
+    final void Function()? liberar = await _esperarVez();
+    try {
+      final Database db = (await this.db)!;
+      if (liberar == null) {
+        // Inside a raw transaction (see _esperarVez): no batch of its own.
+        for (String sql in pSql) {
+          await db.execute(sql);
+        }
+      } else {
+        final Batch lote = db.batch();
+        for (String sql in pSql) {
+          lote.execute(sql);
+        }
+        result.commitResult = await lote.commit(
+            exclusive: exclusive,
+            noResult: noResult,
+            continueOnError: continueOnError);
+      }
+      result.success = true;
+    } catch (e) {
+      result.errorMessage = e.toString();
+      print('SQFENTITY ERROR while run execSQLList:');
+      print(result.toString());
+    } finally {
+      liberar?.call();
     }
     return result;
   }
@@ -396,31 +495,41 @@ class SqfEntityProvider extends SqfEntityModelBase {
   Future<BoolCommitResult> rawInsertAll(String pSql, List<dynamic>? params,
       {bool? exclusive, bool? noResult, bool? continueOnError}) async {
     final result = BoolCommitResult(success: false);
-    // If there is no open transaction, start one
-    final bool closeBatch = !await batchStart();
-
-    for (var t in params!) {
-      openedBatch[_dbModel!.databaseName!]!
-          .rawInsert(pSql, t.toArgsWithIds() as List<dynamic>);
+    final Batch? loteDoChamador = openedBatch[_dbModel!.databaseName!];
+    if (loteDoChamador != null) {
+      for (var t in params!) {
+        loteDoChamador.rawInsert(pSql, t.toArgsWithIds() as List<dynamic>);
+      }
+      result.success = true;
+      return result;
     }
 
-    if (closeBatch) {
-      try {
-        result
-          ..commitResult = await batchCommit(
-              exclusive: exclusive,
-              noResult: noResult,
-              continueOnError: continueOnError)
-          ..success = true;
-      } catch (e) {
-        result.errorMessage = e.toString();
-        print('SQFENTITY ERROR while run execSQLList:');
-        print(result.toString());
-        rethrow;
+    // Own batch, after the previous writes in the queue (see execSQLList).
+    final void Function()? liberar = await _esperarVez();
+    try {
+      final Database db = (await this.db)!;
+      if (liberar == null) {
+        for (var t in params!) {
+          await db.rawInsert(pSql, t.toArgsWithIds() as List<dynamic>);
+        }
+      } else {
+        final Batch lote = db.batch();
+        for (var t in params!) {
+          lote.rawInsert(pSql, t.toArgsWithIds() as List<dynamic>);
+        }
+        result.commitResult = await lote.commit(
+            exclusive: exclusive,
+            noResult: noResult,
+            continueOnError: continueOnError);
       }
-      openedBatch[_dbModel!.databaseName!] = null;
-    } else {
       result.success = true;
+    } catch (e) {
+      result.errorMessage = e.toString();
+      print('SQFENTITY ERROR while run rawInsertAll:');
+      print(result.toString());
+      rethrow;
+    } finally {
+      liberar?.call();
     }
 
     return result;
@@ -533,6 +642,52 @@ class SqfEntityProvider extends SqfEntityModelBase {
   /// Cancels all of the operations in this batch
   void batchRollback() async {
     openedBatch[_dbModel!.databaseName!] = null;
+  }
+}
+
+/// Write queue of one database (FIFO).
+///
+/// SQLite on desktop works on a single connection: two transactions cannot be
+/// open at the same time, so implicit batches and raw transactions
+/// (execSQL('BEGIN') ... COMMIT) wait for their turn here. Plain statements and
+/// reads do not use the queue.
+class _FilaEscrita {
+  Future<void> _ultima = Future<void>.value();
+
+  /// A transaction opened with execSQL('BEGIN') holds the queue until
+  /// COMMIT/ROLLBACK.
+  bool transacaoCrua = false;
+  void Function()? _liberarTransacaoCrua;
+
+  /// Waits for the previous writes and returns the function that frees the turn.
+  Future<void Function()> entrar() {
+    final Completer<void> minhaVez = Completer<void>();
+    final Future<void> anterior = _ultima;
+    _ultima = minhaVez.future;
+    return anterior.then((_) {
+      bool liberada = false;
+      return () {
+        if (!liberada) {
+          liberada = true;
+          minhaVez.complete();
+        }
+      };
+    });
+  }
+
+  void abrirTransacaoCrua(void Function()? liberar) {
+    transacaoCrua = true;
+    _liberarTransacaoCrua = liberar;
+  }
+
+  void fecharTransacaoCrua() {
+    if (!transacaoCrua) {
+      return;
+    }
+    transacaoCrua = false;
+    final void Function()? liberar = _liberarTransacaoCrua;
+    _liberarTransacaoCrua = null;
+    liberar?.call();
   }
 }
 // END DATABASE PROVIDER
